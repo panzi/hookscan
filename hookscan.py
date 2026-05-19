@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 
-from typing import Generator, NamedTuple, Sequence, Mapping, Final
+from typing import Generator, NamedTuple, Sequence, Mapping, Final, Literal, Callable
 
 import json
+import tomllib
 import os
 import sys
 
-from os.path import join as join_path
+from os.path import join as join_path, exists
 
 __version__ = '1.0.0'
 
+type Lang = Literal['js', 'rust']
+
 class Match(NamedTuple):
+    type: Lang
     file: str
-    hooks: dict[str, str]
+    npm_hooks: dict[str, str]|None = None
+    build_rs: str|None = None
 
 # https://docs.npmjs.com/cli/v8/using-npm/scripts
 
-HOOKS: Final[Mapping[str, Sequence[str]]] = {
+NPM_HOOKS: Final[Mapping[str, Sequence[str]]] = {
     'cache_add': [
         'prepare'
     ],
@@ -87,13 +92,18 @@ HOOKS: Final[Mapping[str, Sequence[str]]] = {
     ],
 }
 
-def hookscan(dirs: Sequence[str], hooks: Sequence[str], follow_links: bool = False, exit_on_error: bool = False) -> Generator[Match, None, None]:
+def hookscan(
+        dirs: Sequence[str],
+        npm_hooks: Sequence[str] = (),
+        build_rs: bool = True,
+        follow_links: bool = False,
+        on_error: Callable[[str, Exception], None] = lambda path, error: None,
+        on_warning: Callable[[str, Warning], None] = lambda path, warning: None,
+) -> Generator[Match, None, None]:
     visited: set[str] = set()
 
     def onerror(error: OSError) -> None:
-        print(f'{error.filename}: {error}', file=sys.stderr)
-        if exit_on_error:
-            sys.exit(1)
+        on_error(error.filename, error)
 
     for top in dirs:
         for root, dirs, files in os.walk(top, followlinks = follow_links, onerror = onerror):
@@ -112,30 +122,66 @@ def hookscan(dirs: Sequence[str], hooks: Sequence[str], follow_links: bool = Fal
                 else:
                     alts.append(file)
 
-            alts = folded.get('package.json', ())
-            for file in alts:
-                path = join_path(root, file)
-                try:
-                    with open(path, 'rt') as fp:
-                        pkg = json.load(fp)
+            if npm_hooks:
+                alts = folded.get('package.json', ())
+                for file in alts:
+                    path = join_path(root, file)
+                    try:
+                        with open(path, 'rt') as fp:
+                            pkg = json.load(fp)
 
-                    scripts = pkg.get('scripts')
-                    if scripts is not None:
-                        actual_hooks: dict[str, str] = {}
-                        for hook in hooks:
-                            if hook in scripts:
-                                actual_hooks[hook] = scripts[hook]
+                        scripts = pkg.get('scripts')
+                        if scripts is not None:
+                            actual_hooks: dict[str, str] = {}
+                            for hook in npm_hooks:
+                                if hook in scripts:
+                                    actual_hooks[hook] = scripts[hook]
 
-                        if actual_hooks:
-                            yield Match(path, actual_hooks)
+                            if actual_hooks:
+                                yield Match(
+                                    type = 'js',
+                                    file = path,
+                                    npm_hooks = actual_hooks,
+                                )
 
-                except BaseException as exc:
-                    print(f'{path}: {exc}', file=sys.stderr)
+                    except Exception as error:
+                        on_error(path, error)
 
-                    if exit_on_error:
-                        sys.exit(1)
+            if build_rs:
+                alts = folded.get('cargo.toml', ())
+                for file in alts:
+                    path = join_path(root, file)
+                    try:
+                        with open(path, 'rb') as fp:
+                            crate = tomllib.load(fp)
+
+                        pkg = crate.get('package')
+                        if pkg and 'build' in pkg:
+                            build = pkg['build']
+
+                            if build != False:
+                                yield Match(
+                                    type = 'rust',
+                                    file = path,
+                                    build_rs = join_path(root, str(build)),
+                                )
+                            elif exists(join_path(root, "build.rs")):
+                                on_warning(path, Warning(f'build deactivated, but build.rs exists anyway!'))
+
+                        else:
+                            build = "build.rs"
+                            if build in folded:
+                                yield Match(
+                                    type = 'rust',
+                                    file = path,
+                                    build_rs = join_path(root, build),
+                                )
+
+                    except Exception as error:
+                        on_error(path, error)
 
 DEFAULT_ACTIONS: Final[list[str]] = ['install', 'ci']
+DEFAULT_LANGS: Final[list[str]] = ['js', 'rust']
 
 def main() -> None:
     import argparse
@@ -215,26 +261,30 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(formatter_class=SmartFormatter)
 
+    ap.add_argument('--langs', default=None, metavar='LANG[,LANG]',
+        help=f'Comma separated list. [default: {",".join(DEFAULT_LANGS)}]'
+    )
+
     grp = ap.add_mutually_exclusive_group()
 
-    grp.add_argument('-a', '--actions', default=None,
+    grp.add_argument('-a', '--npm-actions', default=None,
         metavar='ACTION[,ACTION ...]',
         help=f'Comma separated list.\n'
              f'\n'
              f'Supported actions:\n'
              f'\n'
-             f"{''.join(f'  {action}\n' for action in HOOKS)}"
-             f'  * (all hooks from above merged)\n'
+             f"{''.join(f'  {action}\n' for action in NPM_HOOKS)}"
+             f'  * (all npm hooks from above merged)\n'
              f'\n'
              f'[default: {",".join(DEFAULT_ACTIONS)}]'
     )
 
-    grp.add_argument('-k', '--hooks', default=None, metavar='HOOK[,HOOK ...]',
+    grp.add_argument('-k', '--npm-hooks', default=None, metavar='HOOK[,HOOK ...]',
         help=f'Comma separated list. [default from action]'
     )
 
-    ap.add_argument('--print-action-hooks', action='store_true', default=False,
-        help='Print the hooks of the given --actions and exit.'
+    ap.add_argument('--print-npm-action-hooks', action='store_true', default=False,
+        help='Print the npm hooks of the given --npm-actions and exit.'
     )
 
     ap.add_argument('-e', '--exit-on-error', action='store_true', default=False,
@@ -259,27 +309,28 @@ def main() -> None:
         print(__version__)
         sys.exit()
 
-    actions_str: str|None = args.actions
-    hooks_str: str|None = args.hooks
+    npm_actions_str: str|None = args.npm_actions
+    npm_hooks_str: str|None = args.npm_hooks
     paths: list[str] = args.paths or ['.']
-    print_action_hooks: bool = args.print_action_hooks
+    print_npm_action_hooks: bool = args.print_npm_action_hooks
     exit_on_error: bool = args.exit_on_error
     follow_links: bool = args.follow_links
+    langs: set[str] = set(args.langs) if args.langs is not None else set(DEFAULT_LANGS)
 
-    if print_action_hooks:
+    if print_npm_action_hooks:
         actions: set[str] = set()
-        if actions_str is None:
+        if npm_actions_str is None:
             actions.update(DEFAULT_ACTIONS)
-        elif actions_str:
-            for action in actions_str:
+        elif npm_actions_str:
+            for action in npm_actions_str:
                 action = action.strip().casefold().replace(' ', '_')
                 if action == '*':
-                    actions.update(HOOKS)
+                    actions.update(NPM_HOOKS)
                 else:
                     actions.add(action)
 
         for action in actions:
-            action_hooks = HOOKS.get(action)
+            action_hooks = NPM_HOOKS.get(action)
             if action_hooks is None:
                 print(f'Unknown action: {action}', file=sys.stderr)
             else:
@@ -290,35 +341,66 @@ def main() -> None:
 
         sys.exit()
 
-    hooks: set[str] = set()
+    npm_hooks: set[str] = set()
 
-    if actions_str is None and hooks_str is None:
-        for action in DEFAULT_ACTIONS:
-            hooks.update(HOOKS[action])
-    else:
-        if actions_str:
-            for action in actions_str.split(','):
-                norm_action = action.strip().casefold().replace(' ', '_')
+    if 'js' in langs:
+        if npm_actions_str is None and npm_hooks_str is None:
+            for action in DEFAULT_ACTIONS:
+                npm_hooks.update(NPM_HOOKS[action])
+        else:
+            if npm_actions_str:
+                for action in npm_actions_str.split(','):
+                    norm_action = action.strip().casefold().replace(' ', '_')
 
-                if norm_action == '*':
-                    for action_hooks in HOOKS.values():
-                        hooks.update(action_hooks)
-                else:
-                    action_hooks = HOOKS.get(norm_action)
-                    if action_hooks is None:
-                        print(f'unknown action: {action}')
-                        sys.exit(1)
+                    if norm_action == '*':
+                        for action_hooks in NPM_HOOKS.values():
+                            npm_hooks.update(action_hooks)
+                    else:
+                        action_hooks = NPM_HOOKS.get(norm_action)
+                        if action_hooks is None:
+                            print(f'unknown action: {action}')
+                            sys.exit(1)
 
-                    hooks.update(action_hooks)
+                        npm_hooks.update(action_hooks)
 
-        if hooks_str:
-            hooks.update(hooks_str.split(','))
+            if npm_hooks_str:
+                npm_hooks.update(npm_hooks_str.split(','))
 
-    for match in hookscan(paths, list(hooks), follow_links = follow_links, exit_on_error = exit_on_error):
+    ok = True
+
+    def on_error(path: str, error: Exception) -> None:
+        nonlocal ok
+        ok = False
+        print(f'{path}: {error}', file=sys.stderr)
+        if exit_on_error:
+            sys.exit(1)
+
+    def on_warning(path: str, warning: Warning) -> None:
+        print(f'{path}: Warning: {warning}', file=sys.stderr)
+
+    scanner = hookscan(
+        dirs = paths,
+        npm_hooks = list(npm_hooks),
+        build_rs = 'rust' in langs,
+        follow_links = follow_links,
+        on_error = on_error,
+        on_warning = on_warning,
+    )
+
+    for match in scanner:
         print(f'{match.file}:')
-        for hook, script in match.hooks.items():
-            print(f'  {hook}: {json.dumps(script)}')
+
+        if hooks := match.npm_hooks:
+            for hook, script in hooks.items():
+                print(f'  {hook}: {json.dumps(script)}')
+
+        if build_rs := match.build_rs:
+            print(f'  build: {json.dumps(build_rs)}')
+
         print()
+
+    if not ok:
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
