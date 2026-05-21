@@ -7,7 +7,8 @@ import tomllib
 import os
 import sys
 
-from os.path import join as join_path, exists
+from os.path import join as join_path, exists, realpath
+from collections import defaultdict
 
 __version__ = '1.0.0'
 
@@ -16,8 +17,7 @@ type Lang = Literal['js', 'rust']
 class Match(NamedTuple):
     type: Lang
     file: str
-    npm_hooks: dict[str, str]|None = None
-    build_rs: str|None = None
+    hooks: dict[str, str|list[str]]
 
 # https://docs.npmjs.com/cli/v8/using-npm/scripts
 
@@ -92,35 +92,69 @@ NPM_HOOKS: Final[Mapping[str, Sequence[str]]] = {
     ],
 }
 
+# PHP composer: https://getcomposer.org/doc/articles/scripts.md
+# TODO: per-command grouping?
+COMPOSER_EVENTS: Final[Mapping[str, Sequence[str]]] = {
+    'command': [
+        'pre-install-cmd',
+        'post-install-cmd',
+        'pre-update-cmd',
+        'post-update-cmd',
+        'pre-status-cmd',
+        'post-status-cmd',
+        'pre-archive-cmd',
+        'post-archive-cmd',
+        'pre-autoload-dump',
+        'post-autoload-dump',
+        'post-root-package-install',
+        'post-create-project-cmd',
+    ],
+    'installer': [
+        'pre-operations-exec',
+    ],
+    'package': [
+        'pre-package-install',
+        'post-package-install',
+        'pre-package-update',
+        'post-package-update',
+        'pre-package-uninstall',
+        'post-package-uninstall',
+    ],
+    'plugin': [
+        'init',
+        'command',
+        'pre-file-download',
+        'post-file-download',
+        'pre-command-run',
+        'pre-pool-create',
+    ],
+}
+
 def hookscan(
         dirs: Sequence[str],
         npm_hooks: Sequence[str] = (),
         build_rs: bool = True,
+        composer_events: Sequence[str] = (),
         follow_links: bool = False,
         on_error: Callable[[str, Exception], None] = lambda path, error: None,
         on_warning: Callable[[str, Warning], None] = lambda path, warning: None,
 ) -> Generator[Match, None, None]:
     visited: set[str] = set()
 
-    def onerror(error: OSError) -> None:
-        on_error(error.filename, error)
-
     for top in dirs:
-        for root, dirs, files in os.walk(top, followlinks = follow_links, onerror = onerror):
+        for root, dirs, files in os.walk(top, followlinks = follow_links, onerror = lambda error: on_error(error.filename, error)):
+            root = realpath(root)
+
             if root in visited:
                 continue
 
             visited.add(root)
 
             # folded in order to ignore case just in case for Windows
-            folded: dict[str, list[str]] = {}
+            folded: defaultdict[str, list[str]] = defaultdict(list)
             for file in files:
                 folded_file = file.casefold()
-                alts = folded.get(folded_file)
-                if alts is None:
-                    folded[folded_file] = [file]
-                else:
-                    alts.append(file)
+                folded[folded_file].append(file)
 
             if npm_hooks:
                 alts = folded.get('package.json', ())
@@ -132,7 +166,7 @@ def hookscan(
 
                         scripts = pkg.get('scripts')
                         if scripts is not None:
-                            actual_hooks: dict[str, str] = {}
+                            actual_hooks: dict[str, str|list[str]] = {}
                             for hook in npm_hooks:
                                 if hook in scripts:
                                     actual_hooks[hook] = scripts[hook]
@@ -141,7 +175,7 @@ def hookscan(
                                 yield Match(
                                     type = 'js',
                                     file = path,
-                                    npm_hooks = actual_hooks,
+                                    hooks = actual_hooks,
                                 )
 
                     except Exception as error:
@@ -163,7 +197,7 @@ def hookscan(
                                 yield Match(
                                     type = 'rust',
                                     file = path,
-                                    build_rs = join_path(root, str(build)),
+                                    hooks = { 'build': join_path(root, str(build)) },
                                 )
                             elif exists(join_path(root, "build.rs")):
                                 on_warning(path, Warning(f'build deactivated, but build.rs exists anyway!'))
@@ -174,14 +208,45 @@ def hookscan(
                                 yield Match(
                                     type = 'rust',
                                     file = path,
-                                    build_rs = join_path(root, build),
+                                    hooks = { 'build': join_path(root, str(build)) },
                                 )
 
                     except Exception as error:
                         on_error(path, error)
 
-DEFAULT_ACTIONS: Final[list[str]] = ['install', 'ci']
-DEFAULT_LANGS: Final[list[str]] = ['js', 'rust']
+            if composer_events:
+                alts = folded.get('composer.json', ())
+                for file in alts:
+                    path = join_path(root, file)
+                    try:
+                        with open(path, 'rt') as fp:
+                            pkg = json.load(fp)
+
+                        scripts = pkg.get('scripts')
+                        if scripts is not None:
+                            actual_events: dict[str, str|list[str]] = {}
+                            for event in composer_events:
+                                if event in scripts:
+                                    actual_events[event] = scripts[event]
+
+                            if actual_events:
+                                yield Match(
+                                    type = 'js',
+                                    file = path,
+                                    hooks = actual_events,
+                                )
+
+                    except Exception as error:
+                        on_error(path, error)
+
+DEFAULT_NPM_ACTIONS: Final[list[str]] = ['install', 'ci']
+DEFAULT_COMPOSER_EVENTS: Final[list[str]] = ['command', 'installer']
+DEFAULT_LANGS: Final[list[str]] = ['js', 'rust', 'php']
+
+def comma_list(value: str) -> list[str]:
+    value = value.strip()
+
+    return [item.strip() for item in value.split(',')] if value else []
 
 def main() -> None:
     import argparse
@@ -261,13 +326,14 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(formatter_class=SmartFormatter)
 
-    ap.add_argument('--langs', default=None, metavar='LANG[,LANG]',
+    ap.add_argument('--langs', default=DEFAULT_LANGS, type=comma_list, metavar='LANG[,LANG]',
         help=f'Comma separated list. [default: {",".join(DEFAULT_LANGS)}]'
     )
 
     grp = ap.add_mutually_exclusive_group()
 
     grp.add_argument('-a', '--npm-actions', default=None,
+        type=comma_list,
         metavar='ACTION[,ACTION ...]',
         help=f'Comma separated list.\n'
              f'\n'
@@ -276,11 +342,32 @@ def main() -> None:
              f"{''.join(f'  {action}\n' for action in NPM_HOOKS)}"
              f'  * (all npm hooks from above merged)\n'
              f'\n'
-             f'[default: {",".join(DEFAULT_ACTIONS)}]'
+             f'[default: {",".join(DEFAULT_NPM_ACTIONS)}]'
     )
 
-    grp.add_argument('-k', '--npm-hooks', default=None, metavar='HOOK[,HOOK ...]',
-        help=f'Comma separated list. [default from action]'
+    grp.add_argument('-k', '--npm-hooks', default=None,
+        type=comma_list,
+        metavar='HOOK[,HOOK ...]',
+        help=f'Comma separated list. [default from --npm-action]'
+    )
+
+    grp = ap.add_mutually_exclusive_group()
+
+    grp.add_argument('--composer-event-groups', default=None, metavar='GROUP[,GROUP ...]',
+        type=comma_list,
+        help=f'Comma separeted list.\n'
+             f'\n'
+             f'Supported groups:\n'
+             f'\n'
+             f"{''.join(f'  {group}\n' for group in COMPOSER_EVENTS)}"
+             f'  * (all composer events from above merged)\n'
+             f'\n'
+             f'[default: {",".join(DEFAULT_COMPOSER_EVENTS)}]'
+    )
+
+    grp.add_argument('--composer-events', default=None, metavar='EVENT[,EVENT ...]',
+        type=comma_list,
+        help=f"Comma separated list. [default from --composer-event-groups]"
     )
 
     ap.add_argument('--print-npm-action-hooks', action='store_true', default=False,
@@ -309,21 +396,26 @@ def main() -> None:
         print(__version__)
         sys.exit()
 
-    npm_actions_str: str|None = args.npm_actions
-    npm_hooks_str: str|None = args.npm_hooks
-    paths: list[str] = args.paths or ['.']
+    npm_actions: list[str]|None = args.npm_actions
+    npm_hooks: list[str]|None = args.npm_hooks
     print_npm_action_hooks: bool = args.print_npm_action_hooks
+
+    composer_event_groups: list[str]|None = args.composer_event_groups
+    composer_events: list[str]|None = args.composer_events
+
     exit_on_error: bool = args.exit_on_error
     follow_links: bool = args.follow_links
-    langs: set[str] = set(args.langs) if args.langs is not None else set(DEFAULT_LANGS)
+    langs: set[str] = set(args.langs)
+
+    paths: list[str] = args.paths or ['.']
 
     if print_npm_action_hooks:
         actions: set[str] = set()
-        if npm_actions_str is None:
-            actions.update(DEFAULT_ACTIONS)
-        elif npm_actions_str:
-            for action in npm_actions_str:
-                action = action.strip().casefold().replace(' ', '_')
+        if npm_actions is None:
+            actions.update(DEFAULT_NPM_ACTIONS)
+        elif npm_actions:
+            for action in npm_actions:
+                action = action.casefold().replace(' ', '_')
                 if action == '*':
                     actions.update(NPM_HOOKS)
                 else:
@@ -341,30 +433,65 @@ def main() -> None:
 
         sys.exit()
 
-    npm_hooks: set[str] = set()
+    npm_hooks_set: set[str] = set()
 
     if 'js' in langs:
-        if npm_actions_str is None and npm_hooks_str is None:
-            for action in DEFAULT_ACTIONS:
-                npm_hooks.update(NPM_HOOKS[action])
+        langs.remove('js')
+        if npm_actions is None and npm_hooks is None:
+            for action in DEFAULT_NPM_ACTIONS:
+                npm_hooks_set.update(NPM_HOOKS[action])
         else:
-            if npm_actions_str:
-                for action in npm_actions_str.split(','):
-                    norm_action = action.strip().casefold().replace(' ', '_')
+            if npm_actions:
+                for action in npm_actions:
+                    norm_action = action.casefold().replace(' ', '_')
 
                     if norm_action == '*':
                         for action_hooks in NPM_HOOKS.values():
-                            npm_hooks.update(action_hooks)
+                            npm_hooks_set.update(action_hooks)
                     else:
                         action_hooks = NPM_HOOKS.get(norm_action)
                         if action_hooks is None:
-                            print(f'unknown action: {action}')
+                            print(f'unknown npm action: {action}')
                             sys.exit(1)
 
-                        npm_hooks.update(action_hooks)
+                        npm_hooks_set.update(action_hooks)
 
-            if npm_hooks_str:
-                npm_hooks.update(npm_hooks_str.split(','))
+            if npm_hooks:
+                npm_hooks_set.update(npm_hooks)
+
+    composer_events_set: set[str] = set()
+
+    if 'php' in langs:
+        langs.remove('php')
+        if composer_event_groups is None and composer_events is None:
+            for event in DEFAULT_COMPOSER_EVENTS:
+                composer_events_set.update(COMPOSER_EVENTS[event])
+        else:
+            if composer_event_groups:
+                for group in composer_event_groups:
+                    norm_group = group.casefold().replace(' ', '_')
+
+                    if norm_group == '*':
+                        for events in COMPOSER_EVENTS.values():
+                            composer_events_set.update(events)
+                    else:
+                        events = COMPOSER_EVENTS.get(norm_group)
+                        if events is None:
+                            print(f'unknown composer event group: {group}')
+                            sys.exit(1)
+
+                        composer_events_set.update(events)
+
+            if composer_events:
+                composer_events_set.update(composer_events)
+
+    build_rs = 'rust' in langs
+    if build_rs:
+        langs.remove('rust')
+
+    if langs:
+        print(f'illegal value(s) for --langs: {', '.join(langs)}', file=sys.stderr)
+        sys.exit(1)
 
     ok = True
 
@@ -380,8 +507,9 @@ def main() -> None:
 
     scanner = hookscan(
         dirs = paths,
-        npm_hooks = list(npm_hooks),
-        build_rs = 'rust' in langs,
+        npm_hooks = list(npm_hooks_set),
+        composer_events = list(composer_events_set),
+        build_rs = build_rs,
         follow_links = follow_links,
         on_error = on_error,
         on_warning = on_warning,
@@ -390,12 +518,19 @@ def main() -> None:
     for match in scanner:
         print(f'{match.file}:')
 
-        if hooks := match.npm_hooks:
+        if hooks := match.hooks:
+            was_array = False
             for hook, script in hooks.items():
-                print(f'  {hook}: {json.dumps(script)}')
-
-        if build_rs := match.build_rs:
-            print(f'  build: {json.dumps(build_rs)}')
+                if isinstance(script, (list, tuple)):
+                    if was_array:
+                        print()
+                    print(f'  {hook}:')
+                    for entry in script:
+                        print(f'  - {json.dumps(entry)}')
+                    was_array = True
+                else:
+                    print(f'  {hook}: {json.dumps(script)}')
+                    was_array = False
 
         print()
 

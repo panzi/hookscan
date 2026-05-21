@@ -11,8 +11,9 @@ Usage
 
 ```
 usage: hookscan [-h] [--langs LANG[,LANG]] [-a ACTION[,ACTION ...] | -k
-                HOOK[,HOOK ...]] [--print-npm-action-hooks] [-e] [-l]
-                [--version]
+                HOOK[,HOOK ...]] [--composer-event-groups GROUP[,GROUP ...] |
+                --composer-events EVENT[,EVENT ...]]
+                [--print-npm-action-hooks] [-e] [-l] [--version]
                 [paths ...]
 
 positional arguments:
@@ -22,7 +23,7 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --langs LANG[,LANG]   Comma separated list. [default: js,rust]
+  --langs LANG[,LANG]   Comma separated list. [default: js,rust,php]
   -a ACTION[,ACTION ...], --npm-actions ACTION[,ACTION ...]
                         Comma separated list.
                         
@@ -44,7 +45,22 @@ options:
                         
                         [default: install,ci]
   -k HOOK[,HOOK ...], --npm-hooks HOOK[,HOOK ...]
-                        Comma separated list. [default from action]
+                        Comma separated list. [default from --npm-action]
+  --composer-event-groups GROUP[,GROUP ...]
+                        Comma separeted list.
+                        
+                        Supported groups:
+                        
+                          command
+                          installer
+                          package
+                          plugin
+                          * (all composer events from above merged)
+                        
+                        [default: command,installer]
+  --composer-events EVENT[,EVENT ...]
+                        Comma separated list. [default from 
+                        --composer-event-groups]
   --print-npm-action-hooks
                         Print the npm hooks of the given --npm-actions and 
                         exit.
